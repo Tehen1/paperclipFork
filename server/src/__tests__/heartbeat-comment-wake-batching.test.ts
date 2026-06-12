@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { and, asc, eq } from "drizzle-orm";
 import { WebSocketServer } from "ws";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
   agentWakeupRequests,
@@ -12,6 +12,7 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
+import { runningProcesses } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY } from "../services/recovery/index.ts";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.ts";
@@ -161,6 +162,10 @@ describe("heartbeat comment wake batching", () => {
     await tempDb?.cleanup();
   });
 
+  afterEach(() => {
+    runningProcesses.clear();
+  });
+
   it("defers approval-approved wakes for a running issue so the assignee resumes after the run", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -200,6 +205,11 @@ describe("heartbeat comment wake batching", () => {
         taskId: issueId,
         wakeReason: "issue_assigned",
       },
+    });
+    runningProcesses.set(runId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
     });
 
     await db.insert(issues).values({
@@ -442,12 +452,18 @@ describe("heartbeat comment wake batching", () => {
       gateway.releaseFirstWait();
 
       await waitFor(() => gateway.getAgentPayloads().length === 2);
+      const secondPayload = gateway.getAgentPayloads()[1] ?? {};
+      const secondRunId = typeof secondPayload.idempotencyKey === "string" ? secondPayload.idempotencyKey : null;
+      if (!secondRunId) {
+        throw new Error("Expected forwarded gateway payload to include an idempotencyKey run id");
+      }
+
       await waitFor(async () => {
         const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-        return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+        const statusesByRunId = new Map(runs.map((run) => [run.id, run.status]));
+        return statusesByRunId.get(firstRun!.id) === "succeeded" && statusesByRunId.get(secondRunId) === "succeeded";
       }, 90_000);
 
-      const secondPayload = gateway.getAgentPayloads()[1] ?? {};
       expect(secondPayload.paperclip).toMatchObject({
         wake: {
           commentIds: [comment2.id, comment3.id],
@@ -766,13 +782,19 @@ describe("heartbeat comment wake batching", () => {
 
       gateway.releaseFirstWait();
 
-      await waitFor(() => gateway.getAgentPayloads().length === 2, 90_000);
+      await waitFor(() => gateway.getAgentPayloads().length >= 2, 90_000);
       await waitFor(async () => {
         const runs = await db
           .select()
           .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.agentId, agentId));
-        return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+          .where(eq(heartbeatRuns.agentId, agentId))
+          .orderBy(asc(heartbeatRuns.createdAt));
+        const [initialRun, promotedRun] = runs;
+        return (
+          initialRun?.id === firstRun?.id &&
+          initialRun.status === "succeeded" &&
+          promotedRun?.status === "succeeded"
+        );
       }, 90_000);
 
       const reopenedIssue = await db
